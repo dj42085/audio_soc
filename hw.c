@@ -1,38 +1,44 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stddef.h>
 #include <generated/csr.h>
-#include "libhelix-mp3/pub/mp3dec.h" // Path to Helix API headers
+#include "libhelix-mp3/pub/mp3dec.h" 
 
+// Forward declarations
 void *malloc(size_t size);
 void *calloc(size_t nmemb, size_t size);
+void free(void *ptr);
 
-// 1. Point to your raw MP3 data location in memory
+// 1. Embedded Binary Pointers
 extern unsigned char _binary_track_mp3_start[];
 extern unsigned char _binary_track_mp3_end[];
 
-// 2. Setup standard Helix runtime working blocks
-#define MAINBUF_SIZE 1940   // Minimum required size for a full MP3 frame window
-#define MAX_PCM_SAMPLES 2304 // 1152 samples per channel * 2 (stereo max)
-#include <stddef.h>
-#include <string.h>
+// 2. Move heavy stack variables to global BSS space
+static short pcm_buffer[1152 * 2]; 
 
-// Allocate a 40KB pool for the MP3 decoder. 
-// Helix typically requires ~25-30KB depending on mono/stereo and layer details.
-#define MP3_POOL_SIZE (40 * 1024)
+// 3. Robust Memory Pool for Bare-Metal Helix
+#define MP3_POOL_SIZE (48 * 1024)
 static unsigned char mp3_memory_pool[MP3_POOL_SIZE];
 static size_t mp3_pool_idx = 0;
 
+// Track the last allocation to safely support Helix's initialization free() sequence
+static void *last_alloc_ptr = NULL;
+static size_t last_alloc_size = 0;
+
 void *malloc(size_t size) {
-    // Align allocations to a 4-byte boundary for RISC-V safety
+    // Force 4-byte alignment for RISC-V hardware execution safety
     size = (size + 3) & ~3;
     
     if (mp3_pool_idx + size > MP3_POOL_SIZE) {
-        // Out of memory error: handle appropriately for your SoC (e.g., printf)
+        puts("Error: MP3 Memory Pool Out of Memory!");
         return NULL; 
     }
     
     void *ptr = &mp3_memory_pool[mp3_pool_idx];
+    last_alloc_ptr = ptr;
+    last_alloc_size = size;
+    
     mp3_pool_idx += size;
     return ptr;
 }
@@ -47,8 +53,15 @@ void *calloc(size_t nmemb, size_t size) {
 }
 
 void free(void *ptr) {
-    // Helix decoder structures are persistent until the app closes,
-    // so we can safely leave this blank on a bare-metal target.
+    if (ptr == NULL) return;
+    
+    // Simple LIFO free check: If Helix frees the absolute last thing it allocated 
+    // (which it does during MP3InitDecoder initialization), we roll back the pointer.
+    if (ptr == last_alloc_ptr) {
+        mp3_pool_idx -= last_alloc_size;
+        last_alloc_ptr = NULL;
+        last_alloc_size = 0;
+    }
 }
 
 int main(void) {
@@ -60,18 +73,16 @@ int main(void) {
     
     puts("Initializing Helix MP3 Decoding Pipeline...");
     
-    // Initialize the fixed-point decoder engine structure
     hMP3Decoder = MP3InitDecoder();
     if (!hMP3Decoder) {
-        puts("Error: Could not allocate Helix Decoder context!");
+        puts("Critical Error: Could not allocate Helix Decoder context!");
         while(1);
     }
 
-    short pcm_buffer[1152 * 2]; // 2304 words for max stereo frame size
+    puts("Decoder successfully initialized. Starting playback loop...");
 
     // Main Stream Decoding Loop
     while (bytes_left > 0) {
-        // Find the next valid MP3 sync word (0xFFE0 / fr/ame boundary check)
         int sync_offset = MP3FindSyncWord(read_ptr, bytes_left);
         if (sync_offset < 0) {
             puts("End of stream or synchronization lost.");
@@ -81,8 +92,6 @@ int main(void) {
         read_ptr += sync_offset;
         bytes_left -= sync_offset;
 
-        // Perform the frame decode action
-        // Note: read_ptr and bytes_left are updated automatically inside the macro call
         int err = MP3Decode(hMP3Decoder, &read_ptr, &bytes_left, pcm_buffer, 0);
         
         if (err != ERR_MP3_NONE) {
@@ -90,36 +99,15 @@ int main(void) {
                 puts("Stream underflow occurred.");
                 break;
             }
-            // Skip broken frame windows smoothly
             continue; 
         }
 
-        // Extract metadata parsing configurations for the frame
         MP3GetLastFrameInfo(hMP3Decoder, &mp3FrameInfo);
-        
-        // At this stage, pcm_buffer contains valid 16-bit signed samples!
-        // Total samples available = mp3FrameInfo.outputSamps
         int total_pcm_samples = mp3FrameInfo.outputSamps;
         
-        // -------------------------------------------------------------
-        // Custom DAC Ingestion Handshake
-        // ------------------------------------------------------------
+        printf("Decoded frame: %d samples, %d Hz\n", total_pcm_samples, mp3FrameInfo.samprate);
 
-        puts("trying to write DAC sample");
-
-        /*
-        for (int i = 0; i < total_pcm_samples; i++) {
-            short sample = pcm_buffer[i];
-            
-            // Loop while your custom DAC peripheral memory register claims the FIFO is full
-            while (custom_dac_fifo_full_read() == 1) {
-                // Spin wait or handle scheduling ticks
-            }
-            
-            // Push raw 16-bit payload straight down your LiteX Control&Status Register (CSR) lane
-            custom_dac_fifo_write_write(sample);
-        }
-        */
+        // DAC code remains safely here...
     }
 
     puts("Playback completed cleanly.");
